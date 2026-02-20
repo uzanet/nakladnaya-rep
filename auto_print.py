@@ -102,11 +102,12 @@ def print_excel_file(filepath: str) -> None:
 
         for i in range(1, wb.Sheets.Count + 1):
             ps = wb.Sheets(i).PageSetup
-            ps.PaperSize = 9        # xlPaperA4
-            ps.Orientation = 2      # xlLandscape
+            # Zoom = False обязательно до FitToPages-свойств
             ps.Zoom = False
             ps.FitToPagesWide = 1
-            ps.FitToPagesTall = False
+            ps.FitToPagesTall = 1   # 1 = вписать; False/0 сбрасывает режим
+            ps.PaperSize = 9        # xlPaperA4
+            ps.Orientation = 2      # xlLandscape
 
         wb.PrintOut()
         wb.Close(False)
