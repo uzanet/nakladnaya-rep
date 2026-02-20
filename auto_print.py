@@ -6,6 +6,8 @@
 При согласии — печатает на A4, альбомная ориентация, вписать на одну страницу.
 """
 
+import ctypes
+import ctypes.wintypes
 import os
 import sys
 import time
@@ -15,12 +17,13 @@ import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
 
+import pystray
+from PIL import Image, ImageDraw
+
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # ─── Настройки ───────────────────────────────────────────────────────────────
-
-DOWNLOADS_FOLDER = str(Path.home() / "Downloads")
 
 # Префиксы файлов для отслеживания
 PREFIXES = ("ОС-2", "М11")
@@ -28,7 +31,45 @@ PREFIXES = ("ОС-2", "М11")
 # Допустимые расширения Excel
 EXTENSIONS = (".xlsx", ".xls", ".xlsm", ".xlsb")
 
+# Окно подавления дублирующих событий watchdog для одного файла (секунды)
+_DEDUP_WINDOW = 3.0
+
 # ─── Вспомогательные функции ─────────────────────────────────────────────────
+
+
+def _get_downloads_folder() -> str:
+    """
+    Возвращает путь к папке Загрузки через Windows API (не зависит от локали).
+    Fallback — ~/Downloads.
+    """
+    FOLDERID_Downloads = "{374DE290-123F-4565-9164-39C4925E467B}"
+    try:
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", ctypes.c_ulong),
+                ("Data2", ctypes.c_ushort),
+                ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        guid = GUID()
+        ctypes.windll.ole32.CLSIDFromString(FOLDERID_Downloads, ctypes.byref(guid))
+
+        path_ptr = ctypes.c_wchar_p()
+        result = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, None, ctypes.byref(path_ptr)
+        )
+        path = path_ptr.value if result == 0 else None
+        ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+        if path:
+            return path
+    except Exception:  # noqa: BLE001
+        pass
+
+    return str(Path.home() / "Downloads")
+
+
+DOWNLOADS_FOLDER = _get_downloads_folder()
 
 
 def is_matching_file(filepath: str) -> bool:
@@ -88,14 +129,29 @@ _file_queue: queue.Queue = queue.Queue()
 class ExcelFileHandler(FileSystemEventHandler):
     """Обработчик событий файловой системы для watchdog."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._recently_enqueued: dict[str, float] = {}
+        self._lock = threading.Lock()
+
     def _enqueue(self, filepath: str) -> None:
-        if is_matching_file(filepath):
-            _file_queue.put(filepath)
+        if not is_matching_file(filepath):
+            return
+        now = time.monotonic()
+        with self._lock:
+            if now - self._recently_enqueued.get(filepath, 0.0) < _DEDUP_WINDOW:
+                return  # дубликат события — пропускаем
+            self._recently_enqueued[filepath] = now
+            # Чистим старые записи, чтобы словарь не рос бесконечно
+            cutoff = now - 60.0
+            self._recently_enqueued = {
+                k: v for k, v in self._recently_enqueued.items() if v > cutoff
+            }
+        _file_queue.put(filepath)
 
     def on_created(self, event):
         """Новый файл создан (в т.ч. скачан напрямую)."""
         if not event.is_directory:
-            # Небольшая пауза, чтобы файл успел полностью записаться
             time.sleep(1.5)
             self._enqueue(event.src_path)
 
@@ -104,6 +160,12 @@ class ExcelFileHandler(FileSystemEventHandler):
         if not event.is_directory:
             time.sleep(0.3)
             self._enqueue(event.dest_path)
+
+    def on_modified(self, event):
+        """Файл перезаписан (браузер скачивает поверх существующего файла)."""
+        if not event.is_directory:
+            time.sleep(1.5)
+            self._enqueue(event.src_path)
 
 
 # ─── Опрос очереди в главном потоке ──────────────────────────────────────────
@@ -146,6 +208,41 @@ def _ask_and_print(root: tk.Tk, filepath: str) -> None:
         ).start()
 
 
+# ─── Системный трей ───────────────────────────────────────────────────────────
+
+
+def _create_tray_image() -> Image.Image:
+    """Зелёный квадрат 64×64 с белым крестом — иконка в трее."""
+    img = Image.new("RGB", (64, 64), color="#217346")  # Excel green
+    draw = ImageDraw.Draw(img)
+    m, w, lw = 12, 64, 8
+    draw.line([(m, m), (w - m, w - m)], fill="white", width=lw)
+    draw.line([(w - m, m), (m, w - m)], fill="white", width=lw)
+    return img
+
+
+def _create_tray_icon(root: tk.Tk) -> pystray.Icon:
+    """Создаёт иконку в области уведомлений и запускает её в фоновом потоке."""
+
+    def on_quit(icon: pystray.Icon, item: pystray.MenuItem) -> None:
+        icon.stop()
+        root.after(0, root.quit)
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Авто-печать Excel", None, enabled=False),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Выход", on_quit),
+    )
+    icon = pystray.Icon(
+        "auto_print_excel",
+        _create_tray_image(),
+        "Авто-печать Excel",
+        menu,
+    )
+    threading.Thread(target=icon.run, daemon=True).start()
+    return icon
+
+
 # ─── Точка входа ─────────────────────────────────────────────────────────────
 
 
@@ -154,6 +251,9 @@ def main() -> None:
     root = tk.Tk()
     root.withdraw()
     root.title("Авто-печать Excel")
+
+    # Иконка в системном трее
+    _create_tray_icon(root)
 
     # Запуск наблюдателя за папкой Загрузки
     observer = Observer()
