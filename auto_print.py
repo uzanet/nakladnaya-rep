@@ -26,7 +26,7 @@ from watchdog.events import FileSystemEventHandler
 # ─── Настройки ───────────────────────────────────────────────────────────────
 
 # Префиксы файлов для отслеживания
-PREFIXES = ("ОС-2", "М11")
+PREFIXES = ("ОС_2", "М11")
 
 # Допустимые расширения Excel
 EXTENSIONS = (".xlsx", ".xls", ".xlsm", ".xlsb")
