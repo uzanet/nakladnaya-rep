@@ -84,20 +84,20 @@ def is_matching_file(filepath: str) -> bool:
 def print_excel_file(filepath: str) -> None:
     """Открывает Excel через COM и печатает файл с заданными параметрами."""
     try:
+        import pythoncom
         import win32com.client  # noqa: PLC0415  (доступно только на Windows)
     except ImportError:
-        messagebox.showerror(
-            "Ошибка",
-            "Не удалось импортировать win32com.client.\n"
-            "Установите пакет pywin32:\n  pip install pywin32",
-        )
+        _file_queue.put(("error", "Не удалось импортировать win32com.\nУстановите pywin32."))
         return
 
-    excel = win32com.client.Dispatch("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
-
+    # COM должен быть инициализирован в каждом новом потоке
+    pythoncom.CoInitialize()
+    excel = None
     try:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+
         wb = excel.Workbooks.Open(os.path.abspath(filepath))
 
         for i in range(1, wb.Sheets.Count + 1):
@@ -112,13 +112,15 @@ def print_excel_file(filepath: str) -> None:
         wb.Close(False)
 
     except Exception as exc:  # noqa: BLE001
-        messagebox.showerror("Ошибка при печати", str(exc))
+        _file_queue.put(("error", str(exc)))
 
     finally:
-        try:
-            excel.Quit()
-        except Exception:  # noqa: BLE001
-            pass
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:  # noqa: BLE001
+                pass
+        pythoncom.CoUninitialize()
 
 
 # ─── Очередь файлов (поток наблюдателя → главный поток Tkinter) ──────────────
@@ -175,8 +177,11 @@ def _poll_queue(root: tk.Tk) -> None:
     """Вызывается каждые 500 мс из главного цикла Tkinter."""
     try:
         while True:
-            filepath = _file_queue.get_nowait()
-            _ask_and_print(root, filepath)
+            item = _file_queue.get_nowait()
+            if isinstance(item, tuple) and item[0] == "error":
+                messagebox.showerror("Ошибка при печати", item[1])
+            else:
+                _ask_and_print(root, item)
     except queue.Empty:
         pass
     finally:
