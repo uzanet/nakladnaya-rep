@@ -1,9 +1,9 @@
 """
-Авто-печать Excel файлов из папки Загрузки (версия HR).
+Авто-печать файлов из папки Загрузки (версия HR).
 
-Мониторит папку Загрузки. При появлении нового файла Excel,
+Мониторит папку Загрузки. При появлении нового файла Excel или Word,
 содержащего в названии одно из ключевых слов, показывает диалог подтверждения.
-При согласии — печатает на A4, альбомная ориентация, вписать на одну страницу.
+При согласии — печатает файл (Excel: A4, альбомная, вписать на страницу; Word: как есть).
 """
 
 import ctypes
@@ -29,7 +29,13 @@ from watchdog.events import FileSystemEventHandler
 KEYWORDS = ("ОС_2", "М11")
 
 # Допустимые расширения Excel
-EXTENSIONS = (".xlsx", ".xls", ".xlsm", ".xlsb")
+EXCEL_EXTENSIONS = (".xlsx", ".xls", ".xlsm", ".xlsb")
+
+# Допустимые расширения Word
+WORD_EXTENSIONS = (".docx", ".doc", ".docm")
+
+# Все отслеживаемые расширения
+EXTENSIONS = EXCEL_EXTENSIONS + WORD_EXTENSIONS
 
 # Окно подавления дублирующих событий watchdog для одного файла (секунды)
 _DEDUP_WINDOW = 3.0
@@ -81,16 +87,24 @@ def is_matching_file(filepath: str) -> bool:
     )
 
 
-def print_excel_file(filepath: str) -> None:
-    """Открывает Excel через COM и печатает файл с заданными параметрами."""
+def print_file(filepath: str) -> None:
+    """Определяет тип файла и печатает через соответствующее приложение COM."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in EXCEL_EXTENSIONS:
+        _print_excel(filepath)
+    elif ext in WORD_EXTENSIONS:
+        _print_word(filepath)
+
+
+def _print_excel(filepath: str) -> None:
+    """Открывает Excel через COM и печатает файл: A4, альбомная, вписать на страницу."""
     try:
         import pythoncom
-        import win32com.client  # noqa: PLC0415  (доступно только на Windows)
+        import win32com.client  # noqa: PLC0415
     except ImportError:
         _file_queue.put(("error", "Не удалось импортировать win32com.\nУстановите pywin32."))
         return
 
-    # COM должен быть инициализирован в каждом новом потоке
     pythoncom.CoInitialize()
     excel = None
     try:
@@ -102,10 +116,9 @@ def print_excel_file(filepath: str) -> None:
 
         for i in range(1, wb.Sheets.Count + 1):
             ps = wb.Sheets(i).PageSetup
-            # Zoom = False обязательно до FitToPages-свойств
             ps.Zoom = False
             ps.FitToPagesWide = 1
-            ps.FitToPagesTall = 1   # 1 = вписать; False/0 сбрасывает режим
+            ps.FitToPagesTall = 1
             ps.PaperSize = 9        # xlPaperA4
             ps.Orientation = 2      # xlLandscape
 
@@ -119,6 +132,38 @@ def print_excel_file(filepath: str) -> None:
         if excel is not None:
             try:
                 excel.Quit()
+            except Exception:  # noqa: BLE001
+                pass
+        pythoncom.CoUninitialize()
+
+
+def _print_word(filepath: str) -> None:
+    """Открывает Word через COM и печатает файл с настройками по умолчанию."""
+    try:
+        import pythoncom
+        import win32com.client  # noqa: PLC0415
+    except ImportError:
+        _file_queue.put(("error", "Не удалось импортировать win32com.\nУстановите pywin32."))
+        return
+
+    pythoncom.CoInitialize()
+    word = None
+    try:
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = False
+
+        doc = word.Documents.Open(os.path.abspath(filepath))
+        doc.PrintOut()
+        doc.Close(False)
+
+    except Exception as exc:  # noqa: BLE001
+        _file_queue.put(("error", str(exc)))
+
+    finally:
+        if word is not None:
+            try:
+                word.Quit()
             except Exception:  # noqa: BLE001
                 pass
         pythoncom.CoUninitialize()
@@ -208,7 +253,7 @@ def _ask_and_print(root: tk.Tk, filepath: str) -> None:
     if answer:
         # Печать в отдельном потоке, чтобы не блокировать интерфейс
         threading.Thread(
-            target=print_excel_file,
+            target=print_file,
             args=(filepath,),
             daemon=True,
         ).start()
